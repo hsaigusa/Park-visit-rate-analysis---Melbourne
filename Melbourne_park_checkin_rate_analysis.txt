@@ -1,0 +1,105 @@
+--1. create table 'park_checkin' table for analysis
+create table  park_checkin as SELECT * 
+	FROM
+	   (select uid, poi, date, time + '11:00:00' as aus_time, tags->'leisure' as place, tags->'name' as name, geom
+			FROM (SELECT d.*, c.tags 
+				FROM (WITH pois AS (SELECT poi,geom 
+										FROM spatial.checkins_melbourne group by poi,geom)   --extract poi and geom for spatial join
+					SELECT a.*, st_collect(a.geom, st_transform(b.way,4326)),                --get joined geometry
+							b.tags
+								FROM
+									pois as a
+									LEFT JOIN
+									spatial.melbourne_osm_polygon as b
+									ON ST_Intersects(st_transform(a.geom,3857), b.way)                    --spatial join
+								WHERE NOT b.tags?'boundary') c INNER JOIN spatial.checkins_melbourne d    --exclude an obviously unrelevant tag
+																ON c.poi = d.poi) e 
+																WHERE tags?'leisure') f                   --parks are inside of leisure tag
+	WHERE f.place = 'park' --filter the data to get only 'park' rows
+
+
+--2. Distance from melbourne central station / check-in percentage of each zone 
+--Get the percentage of each zone from Melbourne Central Station (MCS)
+SELECT
+	round(sum(cnt1)/sum(cnt40),2) as per_within_1km,                 -- Area ~1km percentage
+	round((sum(cnt2) - sum(cnt1))/sum(cnt40),2) as per_1_to_2km,     -- Area 1~2km percentage
+	round((sum(cnt5) - sum(cnt2))/sum(cnt40),2) as per_2_to_5km,     -- Area 2~5km percentage
+	round((sum(cnt10) - sum(cnt5))/sum(cnt40),2) as per_5_to_10km,   -- Area 5~10km percentage
+	round((sum(cnt20) - sum(cnt10))/sum(cnt40),2) as per_10_to_20km, -- Area 10~20km percentage
+	round((sum(cnt40) - sum(cnt20))/sum(cnt40),2) as per_20_to_40km  -- Area 20~40km percentage
+		FROM 
+--Count the number of check-in counts in each area using CASE statement. New counts are aggregated in each area level
+		(SELECT 
+			CASE WHEN dis_1km = 'true' THEN count(dis_1km) END as cnt1,    --count Area ~1km
+			CASE WHEN dis_2km = 'true' THEN count(dis_2km) END as cnt2,    --count Area ~1km + Area 1~2km
+			CASE WHEN dis_5km = 'true' THEN count(dis_5km) END as cnt5,    --count Area ~1km + Area 1~2km + Area 2~5km
+			CASE WHEN dis_10km = 'true' THEN count(dis_10km) END as cnt10, --count Area ~1km + Area 1~2km + Area 2~5km + Area 5km ~10km
+			CASE WHEN dis_20km = 'true' THEN count(dis_20km) END as cnt20, --count Area ~1km + Area 1~2km + Area 2~5km + Area 5km ~10km + Area 10 ~20km
+			CASE WHEN dis_40km = 'true' THEN count(dis_40km) END as cnt40  --count All areas
+				FROM
+--Get the starting polygon of MCS (As several polygons are found, a unique attribute within the station polygon are used for the reference polygon)
+				(WITH MC AS (SELECT
+								a.name, 
+								st_transform(a.way,4326) as mel_cen,
+								st_transform(ST_buffer(st_transform(a.way,3111), 40000),4326)
+									FROM 
+									(SELECT 
+										tags->'name' as name,
+										way 
+											FROM spatial.melbourne_osm_polygon WHERE tags?'name') a
+											WHERE a.name like 'Melbourne Central office tower') -- Reference polygon		
+--Get the points within the each area
+				SELECT 
+					st_dwithin(st_transform(MC.mel_cen,3111), st_transform(geom,3111), 1000) AS dis_1km,   --Check points within the Area ~1km from MCS
+					st_dwithin(st_transform(MC.mel_cen,3111), st_transform(geom,3111), 2000) AS dis_2km,   --Check points within the Area ~2km from MCS
+					st_dwithin(st_transform(MC.mel_cen,3111), st_transform(geom,3111), 5000) AS dis_5km,   --Check points within the Area ~5km from MCS
+					st_dwithin(st_transform(MC.mel_cen,3111), st_transform(geom,3111), 10000) AS dis_10km, --Check points within the Area ~10km from MCS
+					st_dwithin(st_transform(MC.mel_cen,3111), st_transform(geom,3111), 20000) AS dis_20km, --Check points within the Area ~20km from MCS
+					st_dwithin(st_transform(MC.mel_cen,3111), st_transform(geom,3111), 40000) AS dis_40km  --Check points within the Area ~40km from MCS (Covers all points)
+						FROM MC, hsaigusa.park_checkin
+						WHERE extract (year from date) !=2009) a				
+						GROUP BY dis_1km, dis_2km, dis_5km, dis_10km, dis_20km, dis_40km) b --using group by with count for case statement, it can identify the difference of each area from the area one level smaller 
+
+
+--3. monthly trend of park check-in in top5 spots
+--Select the top 5 parks
+WITH top5 as (SELECT name top5_name, count(name) 
+				FROM hsaigusa.park_checkin
+				GROUP BY name ORDER BY count DESC LIMIT 5)
+SELECT 
+	name, 
+	extract (year from date) as year,   --extract year 
+	extract (month from date) as month, --extract month
+	count(extract (month from date))    --count month
+		FROM
+			hsaigusa.park_checkin, top5
+		WHERE top5.top5_name = name AND extract (year from date) = 2010 --Select only 2010
+		GROUP BY year, month, name 
+		ORDER BY name, year, month
+
+--4. Check if top5 parks are included in the 2-5 km Area
+--Select the top 5 parks
+WITH top5 as (SELECT name top5_name, count(name) 
+				FROM hsaigusa.park_checkin
+				GROUP BY name ORDER BY count DESC LIMIT 5)
+SELECT 
+	distinct b.top5_name, 
+	count as checkin_count, 
+	ST_intersects(st_buffer(ST_boundary(ST_buffer(st_transform(a.way,3111), 2000)),3000,'side=left'), st_transform(c.way,3111)) AS intersect_2_5km_area --2-5km area buffer
+		FROM 
+			(SELECT tags->'name' as name, way
+				FROM spatial.melbourne_osm_polygon 
+				WHERE tags?'name') a,              -- for reference polygon identification
+				top5 b,                            
+				(SELECT                            -- to get coincided park geometry to use in ST_intersects
+					osm_id, tags->'name' as name,
+					way 
+						FROM spatial.melbourne_osm_polygon 
+						WHERE tags?'name') c
+		WHERE a.name like 'Melbourne Central office tower'                --reference polygon 
+			AND b.top5_name = c.name --names coincide to top 5 park names
+			AND c.osm_id !=582210568 --exclude unrelated Royal Park (only appears in melbourne_osm_polygon, not in checkins_melbourne)
+		ORDER BY checkin_count DESC
+
+--5. Drop Table
+DROP TABLE hsaigusa.park_checkin
